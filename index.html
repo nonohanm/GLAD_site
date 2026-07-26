@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>대전 아파트 물류 및 주차장 진입 여부 시각화 대시보드</title>
+    <!-- Tailwind CSS for Modern UI -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Leaflet CSS & JS (오픈소스 무료 지도 라이브러리) -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        body { font-family: 'Malgun Gothic', sans-serif; margin: 0; padding: 0; }
+        #map { width: 100%; height: 100%; }
+    </style>
+</head>
+<body class="bg-gray-100 h-screen flex flex-col overflow-hidden">
+
+    <!-- Header & Stats Bar -->
+    <header class="bg-white shadow-md p-4 flex flex-wrap justify-between items-center z-10 shrink-0">
+        <div class="flex items-center space-x-3">
+            <span class="text-2xl font-bold text-blue-600">🚚 대전 아파트 물류 진입 및 주차 대수 대시보드</span>
+            <span class="text-sm bg-blue-100 text-blue-800 px-3 py-1 rounded-full font-semibold">주차장법 기준 (2.7m) & 구글 시트 연동</span>
+        </div>
+        <div class="flex space-x-3 text-sm font-medium">
+            <div class="bg-gray-50 px-3 py-2 rounded-lg border">유효 단지: <span id="total-count" class="font-bold">0</span>개</div>
+            <div class="bg-green-50 text-green-700 px-3 py-2 rounded-lg border border-green-200">진입가능(True): <span id="true-count" class="font-bold">0</span>개</div>
+            <div class="bg-amber-50 text-amber-700 px-3 py-2 rounded-lg border border-amber-200">검증필요(Review): <span id="review-count" class="font-bold">0</span>개</div>
+            <div class="bg-red-50 text-red-700 px-3 py-2 rounded-lg border border-red-200">진입불가(False): <span id="false-count" class="font-bold">0</span>개</div>
+        </div>
+    </header>
+
+    <!-- Main Content Layout -->
+    <div class="flex flex-1 overflow-hidden">
+        <!-- Sidebar Controls & List -->
+        <aside class="w-96 bg-white border-r flex flex-col z-10 shadow-lg shrink-0">
+            <div class="p-4 border-b space-y-3">
+                <input type="text" id="search-input" placeholder="아파트 이름 또는 주소 검색..." class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <div class="grid grid-cols-4 gap-1">
+                    <button onclick="filterMarkers('all')" class="bg-gray-200 hover:bg-gray-300 py-1.5 rounded-md text-xs font-semibold transition">전체</button>
+                    <button onclick="filterMarkers('true')" class="bg-green-100 text-green-800 hover:bg-green-200 py-1.5 rounded-md text-xs font-semibold transition">진입가능</button>
+                    <button onclick="filterMarkers('review')" class="bg-amber-100 text-amber-800 hover:bg-amber-200 py-1.5 rounded-md text-xs font-semibold transition">검증필요</button>
+                    <button onclick="filterMarkers('false')" class="bg-red-100 text-red-800 hover:bg-red-200 py-1.5 rounded-md text-xs font-semibold transition">진입불가</button>
+                </div>
+            </div>
+            <div id="apt-list-container" class="flex-1 overflow-y-auto divide-y p-2 space-y-2">
+                <!-- CSV 데이터 리스트가 동적으로 꽂힙니다 -->
+            </div>
+        </aside>
+
+        <!-- Leaflet Map Container -->
+        <main class="flex-1 relative h-full">
+            <div id="map"></div>
+        </main>
+    </div>
+
+    <!-- 구글 시트 연동 및 지도 렌더링 로직 -->
+    <script>
+        let map;
+        let markersData = [];
+        let markerLayerGroup;
+
+        function initMap() {
+            map = L.map('map').setView([36.3504, 127.3845], 12);
+
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19,
+                attribution: '&copy; OpenStreetMap contributors'
+            }).addTo(map);
+
+            markerLayerGroup = L.layerGroup().addTo(map);
+
+            loadGoogleSheetCSV();
+        }
+
+        async function loadGoogleSheetCSV() {
+            try {
+                // 📌 CORS 우회 프록시를 적용한 구글 시트 데이터 로드
+                const targetUrl = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vQeEv3CHzhisZKnW6mguHjm0K0x-lv6IJh9mWxtR3x-HDx3QMA3ymnQWgAbiAv_QddltrCyikdXRn_i/pub?output=csv';
+                const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`;
+                
+                const response = await fetch(proxyUrl);
+                if (!response.ok) throw new Error("구글 스프레드시트 데이터를 불러오지 못했습니다.");
+                
+                const data = await response.json();
+                const csvText = data.contents;
+                
+                parseCSV(csvText);
+            } catch (error) {
+                console.error("데이터 로드 실패:", error);
+                alert("구글 시트 데이터 연동에 실패했습니다. 네트워크 상태나 퍼블리싱 링크를 확인해주세요.");
+            }
+        }
+
+        function parseCSVLine(text) {
+            const rows = [];
+            let currentRow = [];
+            let currentCol = '';
+            let inQuotes = false;
+
+            for (let i = 0; i < text.length; i++) {
+                const char = text[i];
+                const nextChar = text[i + 1];
+
+                if (char === '"') {
+                    if (inQuotes && nextChar === '"') {
+                        currentCol += '"';
+                        i++;
+                    } else {
+                        inQuotes = !inQuotes;
+                    }
+                } else if (char === ',' && !inQuotes) {
+                    currentRow.push(currentCol.trim());
+                    currentCol = '';
+                } else if ((char === '\r' && nextChar === '\n') || char === '\n') {
+                    if (inQuotes) {
+                        currentCol += char;
+                    } else {
+                        currentRow.push(currentCol.trim());
+                        rows.push(currentRow);
+                        currentRow = [];
+                        currentCol = '';
+                        if (char === '\r') i++;
+                    }
+                } else {
+                    currentCol += char;
+                }
+            }
+            if (currentCol !== '' || currentRow.length > 0) {
+                currentRow.push(currentCol.trim());
+                rows.push(currentRow);
+            }
+            return rows;
+        }
+
+        // 값이 0이거나 None, 정보 없음일 경우 'X'로 변환해주는 헬퍼 함수
+        function formatValue(val, isParking = false) {
+            if (!val || val === 'undefined' || val === 'null') return 'X';
+            const cleanVal = String(val).trim().replace(/^"|"$/g, '');
+            if (cleanVal === '' || cleanVal === '0' || cleanVal === '0.0' || 
+                cleanVal.toLowerCase() === 'none' || cleanVal.toLowerCase() === '정보 없음' || 
+                cleanVal.toLowerCase() === 'nan') {
+                return 'X';
+            }
+            return isParking ? `${cleanVal}대` : cleanVal;
+        }
+
+        function parseCSV(text) {
+            const parsedRows = parseCSVLine(text);
+            if (parsedRows.length < 2) return;
+
+            const headers = parsedRows[0].map(h => h.replace(/^"|"$/g, '').trim());
+            
+            const idxName = headers.findIndex(h => h === 'name' || h === '단지명');
+            const idxYear = headers.findIndex(h => h === 'year' || h === '준공연도');
+            const idxHeight = headers.findIndex(h => h === 'height' || h === '층고');
+            const idxAccessible = headers.findIndex(h => h === 'accessible');
+            const idxLat = headers.findIndex(h => h === 'lat' || h === '위도');
+            const idxLng = headers.findIndex(h => h === 'lng' || h === '경도');
+            const idxAddress = headers.findIndex(h => h === 'address' || h === '주소');
+            const idxKapt = headers.findIndex(h => h === '단지코드' || h === 'kaptCode');
+            const idxParking = headers.findIndex(h => h === '지하주차대수');
+            const idxWelfare = headers.findIndex(h => h === '부대복리시설');
+
+            let trueCnt = 0;
+            let reviewCnt = 0;
+            let falseCnt = 0;
+            let loadedRows = [];
+
+            for (let i = 1; i < parsedRows.length; i++) {
+                const cols = parsedRows[i];
+                if (cols.length < headers.length * 0.5) continue;
+
+                const name = idxName !== -1 ? cols[idxName] : cols[0];
+                const year = parseInt(idxYear !== -1 ? cols[idxYear] : cols[1]) || 2000;
+                const height = idxHeight !== -1 ? cols[idxHeight] : '';
+                const rawAccessible = idxAccessible !== -1 ? cols[idxAccessible] : '';
+                const lat = parseFloat(idxLat !== -1 ? cols[idxLat] : cols[3]);
+                const lng = parseFloat(idxLng !== -1 ? cols[idxLng] : cols[4]);
+                const address = idxAddress !== -1 ? cols[idxAddress] : cols[5];
+                const kaptCode = formatValue(idxKapt !== -1 ? cols[idxKapt] : '');
+                
+                const basementParking = formatValue(idxParking !== -1 ? cols[idxParking] : '', true);
+                const welfareFacility = formatValue(idxWelfare !== -1 ? cols[idxWelfare] : '');
+
+                if (isNaN(lat) || isNaN(lng)) continue;
+
+                let status = 'false';
+                const lowerAcc = rawAccessible.toLowerCase();
+                
+                if (lowerAcc === 'true' || lowerAcc.includes('true')) {
+                    status = 'true';
+                    trueCnt++;
+                } else if (lowerAcc.includes('review') || lowerAcc.includes('검증')) {
+                    status = 'review';
+                    reviewCnt++;
+                } else {
+                    status = 'false';
+                    falseCnt++;
+                }
+
+                loadedRows.push({ 
+                    name: formatValue(name), year, height: formatValue(height), 
+                    accessible: status, rawAccessible, lat, lng, 
+                    address: formatValue(address), kaptCode, basementParking, welfareFacility 
+                });
+            }
+
+            document.getElementById('total-count').innerText = loadedRows.length;
+            document.getElementById('true-count').innerText = trueCnt;
+            document.getElementById('review-count').innerText = reviewCnt;
+            document.getElementById('false-count').innerText = falseCnt;
+
+            markersData = loadedRows;
+            renderMarkers(markersData);
+            renderSidebarList(markersData);
+        }
+
+        function renderMarkers(data) {
+            markerLayerGroup.clearLayers();
+
+            data.forEach(apt => {
+                let markerColor = "#dc2626"; // 기본 빨강 (False)
+                if (apt.accessible === 'true') markerColor = "#2563eb"; // 파랑 (True)
+                else if (apt.accessible === 'review') markerColor = "#d97706"; // 주황 (Needs Review)
+
+                const circleMarker = L.circleMarker([apt.lat, apt.lng], {
+                    radius: 6,
+                    fillColor: markerColor,
+                    color: "#ffffff",
+                    weight: 1.5,
+                    opacity: 1,
+                    fillOpacity: 0.85
+                });
+
+                let statusText = '🚨 도보 배송 전환 (False)';
+                let statusColor = '#dc2626';
+                if (apt.accessible === 'true') {
+                    statusText = '✅ 탑차 진입 가능 (True)';
+                    statusColor = '#2563eb';
+                } else if (apt.accessible === 'review') {
+                    statusText = '⚠️ 현장 검증 필요 (Needs Review)';
+                    statusColor = '#d97706';
+                }
+
+                const popupContent = `
+                    <div style="font-family: 'Malgun Gothic'; padding: 5px; max-width: 260px;">
+                        <div style="font-weight: bold; font-size: 14px; color: #111;">${apt.name}</div>
+                        <div style="font-size: 11px; color: #555; margin-top: 3px;">📍 ${apt.address}</div>
+                        <div style="font-size: 11px; color: #333; margin-top: 3px;">🔑 K-apt 코드: ${apt.kaptCode}</div>
+                        <div style="font-size: 12px; color: #555; margin-top: 3px;">준공: ${apt.year}년 | 층고 기준: ${apt.height}</div>
+                        <div style="font-size: 12px; color: #555; margin-top: 3px;">🅿️ 지하주차대수: ${apt.basementParking}</div>
+                        <div style="font-size: 11px; color: #666; margin-top: 3px;">🏢 부대복리시설: ${apt.welfareFacility}</div>
+                        <div style="font-size: 12px; font-weight: bold; margin-top: 5px; color: ${statusColor};">
+                            ${statusText}
+                        </div>
+                    </div>
+                `;
+
+                circleMarker.bindPopup(popupContent);
+                markerLayerGroup.addLayer(circleMarker);
+                apt.leafletMarker = circleMarker;
+            });
+        }
+
+        function renderSidebarList(data) {
+            const container = document.getElementById('apt-list-container');
+            container.innerHTML = '';
+
+            const displayData = data.slice(0, 200);
+
+            displayData.forEach(apt => {
+                let borderColor = 'border-l-red-500';
+                let badgeColor = 'text-red-600';
+                let badgeText = '🚨 False (진입 불가)';
+
+                if (apt.accessible === 'true') {
+                    borderColor = 'border-l-blue-500';
+                    badgeColor = 'text-blue-600';
+                    badgeText = '✅ True (진입 가능)';
+                } else if (apt.accessible === 'review') {
+                    borderColor = 'border-l-amber-500';
+                    badgeColor = 'text-amber-600';
+                    badgeText = '⚠️ Needs Review (검증 필요)';
+                }
+
+                const card = document.createElement('div');
+                card.className = `p-3 rounded-lg border cursor-pointer hover:bg-gray-50 transition border-l-4 ${borderColor}`;
+                
+                card.innerHTML = `
+                    <div class="font-semibold text-sm text-gray-800">${apt.name}</div>
+                    <div class="text-xs text-gray-500 mt-0.5 truncate">📍 ${apt.address}</div>
+                    <div class="text-xs text-gray-400 mt-0.5">준공: ${apt.year}년 | 지하주차: ${apt.basementParking}</div>
+                    <div class="text-xs text-gray-500 mt-0.5 truncate">🏢 시설: ${apt.welfareFacility}</div>
+                    <div class="text-xs font-bold mt-1 ${badgeColor}">
+                        ${badgeText}
+                    </div>
+                `;
+                card.onclick = () => {
+                    map.setView([apt.lat, apt.lng], 16);
+                    apt.leafletMarker.openPopup();
+                };
+                container.appendChild(card);
+            });
+
+            if (data.length > 200) {
+                const notice = document.createElement('div');
+                notice.className = "text-center text-xs text-gray-400 py-3";
+                notice.innerText = `외 ${data.length - 200}개 단지 (검색창을 통해 확인하세요)`;
+                container.appendChild(notice);
+            }
+        }
+
+        function filterMarkers(type) {
+            let filtered = [];
+
+            markersData.forEach(apt => {
+                let show = false;
+                if (type === 'all') show = true;
+                if (type === 'true' && apt.accessible === 'true') show = true;
+                if (type === 'review' && apt.accessible === 'review') show = true;
+                if (type === 'false' && apt.accessible === 'false') show = true;
+
+                if (show) {
+                    if (!markerLayerGroup.hasLayer(apt.leafletMarker)) {
+                        markerLayerGroup.addLayer(apt.leafletMarker);
+                    }
+                    filtered.push(apt);
+                } else {
+                    markerLayerGroup.removeLayer(apt.leafletMarker);
+                }
+            });
+            renderSidebarList(filtered);
+        }
+
+        document.getElementById('search-input').addEventListener('input', function(e) {
+            const keyword = e.target.value.trim().toLowerCase();
+            const filtered = markersData.filter(apt => 
+                apt.name.toLowerCase().includes(keyword) || apt.address.toLowerCase().includes(keyword)
+            );
+            
+            markerLayerGroup.clearLayers();
+            filtered.forEach(apt => {
+                markerLayerGroup.addLayer(apt.leafletMarker);
+            });
+            renderSidebarList(filtered);
+        });
+
+        window.onload = initMap;
+    </script>
+</body>
+</html>
